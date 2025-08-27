@@ -4,6 +4,7 @@ import os
 import json
 import requests
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
@@ -1073,8 +1074,27 @@ async def download_image_asset(
         if not image_url:
             return f"No download URL found for image asset ID {asset_id}"
         
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
+        # Validate and sanitize the output directory to prevent path traversal
+        try:
+            # Get the base directory (current working directory)
+            base_dir = Path.cwd()
+            # Resolve the output directory to an absolute path
+            resolved_output_dir = Path(output_dir).resolve()
+            
+            # Ensure the resolved path is within or under the current working directory
+            # This prevents path traversal attacks like "../../../etc"
+            try:
+                resolved_output_dir.relative_to(base_dir)
+            except ValueError:
+                # If the path is not relative to base_dir, use the default safe directory
+                resolved_output_dir = base_dir / "ad_images"
+                logger.warning(f"Invalid output directory '{output_dir}' - using default './ad_images'")
+            
+            # Create output directory if it doesn't exist
+            resolved_output_dir.mkdir(parents=True, exist_ok=True)
+            
+        except Exception as e:
+            return f"Error creating output directory: {str(e)}"
         
         # Download the image
         image_response = requests.get(image_url)
@@ -1084,7 +1104,7 @@ async def download_image_asset(
         # Clean the filename to be safe for filesystem
         safe_name = ''.join(c for c in asset_name if c.isalnum() or c in ' ._-')
         filename = f"{asset_id}_{safe_name}.jpg"
-        file_path = os.path.join(output_dir, filename)
+        file_path = resolved_output_dir / filename
         
         # Save the image
         with open(file_path, 'wb') as f:
