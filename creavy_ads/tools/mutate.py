@@ -840,3 +840,112 @@ async def update_campaign_bid(
     envelope = _normalize_response(raw, validate_only)
     envelope["warnings"] = warnings + envelope.get("warnings", [])
     return envelope
+
+
+# ----------------------------------------------------------------------------
+# create_ad_group (adGroups:mutate)
+# ----------------------------------------------------------------------------
+
+_AD_GROUP_STATUSES = {"PAUSED", "ENABLED"}
+
+
+@mcp.tool()
+async def create_ad_group(
+    customer_id: Annotated[
+        str,
+        Field(description="Google Ads customer ID (10 digits, no dashes)."),
+    ],
+    campaign_id: Annotated[
+        str,
+        Field(description="Parent campaign ID."),
+    ],
+    name: Annotated[
+        str,
+        Field(description="Ad group name. Must be unique within the campaign."),
+    ],
+    cpc_bid_micros: Annotated[
+        int,
+        Field(description="Default CPC bid in micros. Example: 400_000 = 0.40 currency units."),
+    ],
+    status: Annotated[
+        str,
+        Field(description="PAUSED (default) or ENABLED. Default PAUSED so no ads run until the operator reviews."),
+    ] = "PAUSED",
+    validate_only: Annotated[
+        bool,
+        Field(description="If True (default), Google validates but does not apply."),
+    ] = True,
+) -> dict:
+    """Create a SEARCH_STANDARD ad group inside an existing campaign.
+
+    Uses ``adGroups:mutate``. An ad group is only a container — it
+    does not spend money on its own, so the risk is low. The default
+    ``status=PAUSED`` makes the two-step create-review-enable flow
+    explicit: the caller adds ads/keywords after this returns, then
+    the operator enables the group from the UI (or via a later
+    ``update_ad_group`` tool).
+
+    Args:
+        customer_id, campaign_id: parent coordinates.
+        name: ad group name (trimmed; must be non-empty after trim).
+        cpc_bid_micros: default CPC bid (> 0).
+        status: PAUSED (default) or ENABLED.
+        validate_only: default True.
+
+    Returns:
+        CREAVY mutate envelope. ``resource_names`` contains the new
+        ad group path (empty in pure validate_only mode because
+        Google returns no resource_name for validation).
+    """
+    trimmed_name = (name or "").strip()
+    if not trimmed_name:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": ["name is required and must be non-empty after trimming"],
+            "raw": {},
+        }
+    if cpc_bid_micros is None or cpc_bid_micros <= 0:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": ["cpc_bid_micros must be a positive integer"],
+            "raw": {},
+        }
+    status_upper = (status or "PAUSED").upper()
+    if status_upper not in _AD_GROUP_STATUSES:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": [f"status must be one of {sorted(_AD_GROUP_STATUSES)}, got {status!r}"],
+            "raw": {},
+        }
+
+    formatted_customer_id = format_customer_id(customer_id)
+    campaign_resource = (
+        f"customers/{formatted_customer_id}/campaigns/{campaign_id}"
+    )
+    client = GoogleAdsClient()
+
+    operation = {
+        "create": {
+            "name": trimmed_name,
+            "campaign": campaign_resource,
+            "status": status_upper,
+            "type": "SEARCH_STANDARD",
+            "cpcBidMicros": str(cpc_bid_micros),
+        }
+    }
+    raw = client.mutate(
+        customer_id=formatted_customer_id,
+        resource="adGroups",
+        operations=[operation],
+        validate_only=validate_only,
+    )
+    return _normalize_response(raw, validate_only)
