@@ -338,3 +338,179 @@ async def enable_campaign(
     envelope = _normalize_response(raw, validate_only)
     envelope.setdefault("warnings", []).append(f"spend-cap ok: {cap_detail}")
     return envelope
+
+
+# ----------------------------------------------------------------------------
+# add_negative_keywords (campaignCriteria:mutate)
+# ----------------------------------------------------------------------------
+
+_MATCH_TYPES = {"EXACT", "PHRASE", "BROAD"}
+_GOOGLE_MAX_KEYWORDS_PER_CALL = 50
+
+
+@mcp.tool()
+async def add_negative_keywords(
+    customer_id: Annotated[
+        str,
+        Field(description="Google Ads customer ID (10 digits, no dashes)."),
+    ],
+    campaign_id: Annotated[
+        str,
+        Field(description="Campaign ID that will receive the negatives."),
+    ],
+    keywords: Annotated[
+        list[str],
+        Field(description="Negative keyword texts. Duplicates (case-insensitive) and existing negatives are filtered out before the API call."),
+    ],
+    match_type: Annotated[
+        str,
+        Field(description="Match type for the negatives — EXACT, PHRASE, or BROAD. EXACT is the safe default."),
+    ] = "EXACT",
+    validate_only: Annotated[
+        bool,
+        Field(description="If True (default), Google validates but does not apply."),
+    ] = True,
+) -> dict:
+    """Attach negative keywords to a campaign.
+
+    Uses ``campaignCriteria:mutate`` with one ``create`` operation per
+    keyword. Only restricts spending, so risk is low — this is the
+    highest-value tool in the weekly audit loop.
+
+    Workflow:
+
+    1. Validate ``match_type`` is one of EXACT/PHRASE/BROAD.
+    2. Fetch existing negatives for the campaign via GAQL and strip
+       any duplicates (case-insensitive, same match type) from the
+       input list. Duplicates land in ``warnings`` so the operator can
+       see what was filtered.
+    3. Cap the remaining list at Google's 50-per-call limit. If the
+       caller sent more, the excess is dropped and reported as a
+       warning (the caller can re-issue in batches).
+    4. Issue the mutate with ``partialFailure=True`` so one malformed
+       keyword does not kill the batch.
+
+    Args:
+        customer_id: Google Ads customer ID.
+        campaign_id: Target campaign.
+        keywords: Keyword texts (whitespace is trimmed; empty strings
+            are ignored).
+        match_type: EXACT/PHRASE/BROAD.
+        validate_only: Default True.
+
+    Returns:
+        CREAVY mutate envelope. ``resource_names`` lists the created
+        criterion resources (or would-be resources in validate_only
+        mode if the API echoes them).
+    """
+    match_type_upper = (match_type or "").upper()
+    if match_type_upper not in _MATCH_TYPES:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": [
+                f"invalid match_type {match_type!r} — must be one of {sorted(_MATCH_TYPES)}"
+            ],
+            "raw": {},
+        }
+
+    # Normalise input: trim, drop empties, dedupe case-insensitively.
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for kw in keywords or []:
+        trimmed = (kw or "").strip()
+        if not trimmed:
+            continue
+        key = trimmed.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(trimmed)
+
+    if not cleaned:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": ["no non-empty keywords supplied after trimming/dedup"],
+            "raw": {},
+        }
+
+    formatted_customer_id = format_customer_id(customer_id)
+    campaign_resource = (
+        f"customers/{formatted_customer_id}/campaigns/{campaign_id}"
+    )
+    client = GoogleAdsClient()
+
+    # Fetch existing negatives so we do not double-insert.
+    existing_query = (
+        "SELECT campaign_criterion.keyword.text, campaign_criterion.keyword.match_type "
+        "FROM campaign_criterion "
+        f"WHERE campaign_criterion.negative = TRUE AND campaign.id = {campaign_id}"
+    )
+    existing: set[tuple[str, str]] = set()
+    try:
+        resp = client.search(formatted_customer_id, existing_query)
+        for row in resp.get("results", []) or []:
+            kw_info = row.get("campaignCriterion", {}).get("keyword", {})
+            text = (kw_info.get("text") or "").lower()
+            mtype = (kw_info.get("matchType") or "").upper()
+            if text:
+                existing.add((text, mtype))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("existing-negatives pre-check failed: %s", exc)
+        # We still proceed — worst case, Google rejects duplicates as partial failures.
+
+    warnings: list[str] = []
+    kept: list[str] = []
+    for kw in cleaned:
+        if (kw.lower(), match_type_upper) in existing:
+            warnings.append(f"skip duplicate negative: {kw!r}")
+            continue
+        kept.append(kw)
+
+    # Enforce Google's per-call cap.
+    if len(kept) > _GOOGLE_MAX_KEYWORDS_PER_CALL:
+        dropped = kept[_GOOGLE_MAX_KEYWORDS_PER_CALL:]
+        kept = kept[:_GOOGLE_MAX_KEYWORDS_PER_CALL]
+        warnings.append(
+            f"exceeded Google per-call limit of {_GOOGLE_MAX_KEYWORDS_PER_CALL}; "
+            f"dropped {len(dropped)} keyword(s): re-issue in another batch"
+        )
+
+    if not kept:
+        return {
+            "success": True,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": warnings or ["all supplied keywords are already present — no-op"],
+            "raw": {},
+        }
+
+    operations = [
+        {
+            "create": {
+                "campaign": campaign_resource,
+                "negative": True,
+                "keyword": {
+                    "text": kw,
+                    "matchType": match_type_upper,
+                },
+            }
+        }
+        for kw in kept
+    ]
+
+    raw = client.mutate(
+        customer_id=formatted_customer_id,
+        resource="campaignCriteria",
+        operations=operations,
+        validate_only=validate_only,
+    )
+    envelope = _normalize_response(raw, validate_only)
+    envelope["warnings"] = warnings + envelope.get("warnings", [])
+    return envelope
