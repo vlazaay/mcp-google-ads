@@ -1153,3 +1153,275 @@ async def create_responsive_search_ad(
         validate_only=validate_only,
     )
     return _normalize_response(raw, validate_only)
+
+
+# ----------------------------------------------------------------------------
+# create_campaign (3 sequential REST calls, budget -> campaign -> criteria)
+# ----------------------------------------------------------------------------
+
+_KYIV_GEO_CONSTANT = "1012959"   # Kyiv
+_LANG_UK = "1002"                # Ukrainian
+_LANG_EN = "1000"                # English
+
+_ALLOWED_CHANNEL_TYPES = {"SEARCH", "DISPLAY", "PERFORMANCE_MAX"}
+_ALLOWED_CREATE_BID_STRATEGIES = {"MANUAL_CPC", "MAXIMIZE_CONVERSIONS"}
+
+
+def _default_config() -> dict:
+    return {
+        "channel_type": "SEARCH",
+        "bid_strategy": "MANUAL_CPC",
+        "cpc_bid_ceiling_micros": None,
+        "geo_target_constants": [_KYIV_GEO_CONSTANT],
+        "language_constants": [_LANG_UK, _LANG_EN],
+        "network_settings": {
+            "targetGoogleSearch": True,
+            "targetSearchNetwork": False,
+            "targetContentNetwork": False,
+            "targetPartnerSearchNetwork": False,
+        },
+    }
+
+
+def _validate_create_campaign_config(name: str, daily_budget_micros: int, config: dict) -> list[str]:
+    errors: list[str] = []
+    if not (name or "").strip():
+        errors.append("name is required")
+    if daily_budget_micros is None or int(daily_budget_micros) <= 0:
+        errors.append("daily_budget_micros must be > 0")
+
+    channel = (config.get("channel_type") or "SEARCH").upper()
+    if channel not in _ALLOWED_CHANNEL_TYPES:
+        errors.append(f"channel_type must be one of {sorted(_ALLOWED_CHANNEL_TYPES)}")
+    strategy = (config.get("bid_strategy") or "MANUAL_CPC").upper()
+    if strategy not in _ALLOWED_CREATE_BID_STRATEGIES:
+        errors.append(
+            f"bid_strategy must be one of {sorted(_ALLOWED_CREATE_BID_STRATEGIES)} on creation"
+        )
+    if strategy == "MANUAL_CPC":
+        ceiling = config.get("cpc_bid_ceiling_micros")
+        if ceiling is None or int(ceiling) <= 0:
+            errors.append("MANUAL_CPC requires cpc_bid_ceiling_micros > 0 in config")
+    if not config.get("geo_target_constants"):
+        errors.append("geo_target_constants must include at least one geo_target_constant ID")
+    if not config.get("language_constants"):
+        errors.append("language_constants must include at least one language_constant ID")
+    return errors
+
+
+@mcp.tool()
+async def create_campaign(
+    customer_id: Annotated[
+        str,
+        Field(description="Google Ads customer ID (10 digits, no dashes)."),
+    ],
+    name: Annotated[
+        str,
+        Field(description="Campaign name. Example: 'CREAVY — UA Search v1'."),
+    ],
+    daily_budget_micros: Annotated[
+        int,
+        Field(description="Daily budget in micros. 50_000_000 = 50 UAH/day."),
+    ],
+    config: Annotated[
+        dict,
+        Field(description="Optional overrides for channel_type, bid_strategy, cpc_bid_ceiling_micros, geo_target_constants, language_constants, network_settings. Defaults to Kyiv geo + UA/EN langs + SEARCH + MANUAL_CPC."),
+    ] = {},
+    validate_only: Annotated[
+        bool,
+        Field(description="If True (default), Google validates each step but does not apply."),
+    ] = True,
+) -> dict:
+    """Create a full SEARCH campaign: budget -> campaign -> geo/lang criteria.
+
+    Highest-risk tool in Phase 1: three sequential REST calls. The
+    new campaign is ALWAYS created with ``status=PAUSED`` so nothing
+    spends until the operator reviews and explicitly enables.
+
+    Sequence:
+
+    1. ``campaignBudgets:mutate`` (create) — returns the budget resource
+       name. If this fails, we return immediately — nothing else to
+       roll back.
+    2. ``campaigns:mutate`` (create) — references the new budget and
+       carries the bidding strategy. If this fails but step 1 succeeded,
+       the envelope flags the orphan budget under
+       ``warnings`` so the caller can decide whether to clean up.
+    3. (Optional) ``campaignCriteria:mutate`` — one create op per geo
+       target and one per language. Skipped only if both lists are
+       empty.
+
+    Args:
+        customer_id: Google Ads customer ID.
+        name: Campaign name.
+        daily_budget_micros: New budget in micros.
+        config: See module-level defaults. Safe to pass ``{}``.
+        validate_only: Default True.
+
+    Returns:
+        CREAVY mutate envelope. ``resource_names`` lists [budget,
+        campaign, *criteria]. ``raw`` contains the three raw API
+        responses under keys ``budget``, ``campaign``, ``criteria``.
+    """
+    merged = _default_config()
+    merged.update(config or {})
+
+    errors = _validate_create_campaign_config(name, daily_budget_micros, merged)
+    if errors:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": errors,
+            "raw": {},
+        }
+
+    formatted_customer_id = format_customer_id(customer_id)
+    client = GoogleAdsClient()
+    warnings: list[str] = []
+    resource_names: list[str] = []
+    raw_steps: dict[str, Any] = {}
+
+    # Step 1: budget.
+    budget_name = f"{name.strip()} — budget"
+    budget_op = {
+        "create": {
+            "name": budget_name,
+            "amountMicros": str(int(daily_budget_micros)),
+            "deliveryMethod": "STANDARD",
+            "explicitlyShared": False,
+        }
+    }
+    budget_resp = client.mutate(
+        customer_id=formatted_customer_id,
+        resource="campaignBudgets",
+        operations=[budget_op],
+        validate_only=validate_only,
+    )
+    raw_steps["budget"] = budget_resp
+    if "error" in budget_resp and "status_code" in budget_resp:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": [f"step 1 (budget) HTTP {budget_resp.get('status_code')}: {budget_resp.get('error')}"],
+            "raw": raw_steps,
+        }
+    budget_rn = None
+    for r in (budget_resp.get("results") or []):
+        if r.get("resourceName"):
+            budget_rn = r["resourceName"]
+            break
+    if not budget_rn and not validate_only:
+        warnings.append("step 1 (budget): no resourceName returned; cannot continue")
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": warnings,
+            "raw": raw_steps,
+        }
+    # In validate_only mode Google does not return a real resourceName,
+    # so we synthesise a placeholder that lets step 2 format a valid request.
+    budget_ref_for_step2 = budget_rn or f"customers/{formatted_customer_id}/campaignBudgets/VALIDATE_ONLY"
+    if budget_rn:
+        resource_names.append(budget_rn)
+
+    # Step 2: campaign.
+    campaign_body: dict[str, Any] = {
+        "name": name.strip(),
+        "status": "PAUSED",
+        "advertisingChannelType": merged["channel_type"].upper(),
+        "campaignBudget": budget_ref_for_step2,
+        "networkSettings": merged["network_settings"],
+    }
+    strategy = merged["bid_strategy"].upper()
+    if strategy == "MANUAL_CPC":
+        campaign_body["manualCpc"] = {"enhancedCpcEnabled": False}
+        campaign_body["bidCeilingMicros"] = str(int(merged["cpc_bid_ceiling_micros"]))
+    elif strategy == "MAXIMIZE_CONVERSIONS":
+        campaign_body["maximizeConversions"] = {}
+
+    campaign_op = {"create": campaign_body}
+    campaign_resp = client.mutate(
+        customer_id=formatted_customer_id,
+        resource="campaigns",
+        operations=[campaign_op],
+        validate_only=validate_only,
+    )
+    raw_steps["campaign"] = campaign_resp
+    if "error" in campaign_resp and "status_code" in campaign_resp:
+        msg = f"step 2 (campaign) HTTP {campaign_resp.get('status_code')}: {campaign_resp.get('error')}"
+        if budget_rn:
+            msg += f" — budget {budget_rn} was created and may need cleanup"
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": resource_names,
+            "partial_failures": [],
+            "warnings": [msg],
+            "raw": raw_steps,
+        }
+    campaign_rn = None
+    for r in (campaign_resp.get("results") or []):
+        if r.get("resourceName"):
+            campaign_rn = r["resourceName"]
+            break
+    if campaign_rn:
+        resource_names.append(campaign_rn)
+    # In validate_only mode synthesise a placeholder for step 3.
+    campaign_ref_for_step3 = (
+        campaign_rn or f"customers/{formatted_customer_id}/campaigns/VALIDATE_ONLY"
+    )
+
+    # Step 3: geo + language criteria. Skipped only if both are empty.
+    criteria_ops: list[dict] = []
+    for geo in merged.get("geo_target_constants") or []:
+        criteria_ops.append({
+            "create": {
+                "campaign": campaign_ref_for_step3,
+                "location": {
+                    "geoTargetConstant": f"geoTargetConstants/{geo}",
+                },
+            }
+        })
+    for lang in merged.get("language_constants") or []:
+        criteria_ops.append({
+            "create": {
+                "campaign": campaign_ref_for_step3,
+                "language": {
+                    "languageConstant": f"languageConstants/{lang}",
+                },
+            }
+        })
+
+    if criteria_ops:
+        crit_resp = client.mutate(
+            customer_id=formatted_customer_id,
+            resource="campaignCriteria",
+            operations=criteria_ops,
+            validate_only=validate_only,
+        )
+        raw_steps["criteria"] = crit_resp
+        if "error" in crit_resp and "status_code" in crit_resp:
+            warnings.append(
+                f"step 3 (criteria) HTTP {crit_resp.get('status_code')}: {crit_resp.get('error')} "
+                f"— campaign {campaign_rn} exists but has no geo/lang targeting"
+            )
+        else:
+            for r in (crit_resp.get("results") or []):
+                if r.get("resourceName"):
+                    resource_names.append(r["resourceName"])
+
+    envelope = {
+        "success": True,
+        "validate_only": validate_only,
+        "resource_names": resource_names,
+        "partial_failures": [],
+        "warnings": warnings,
+        "raw": raw_steps,
+    }
+    return envelope
