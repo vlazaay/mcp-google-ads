@@ -659,3 +659,184 @@ async def update_campaign_budget(
     envelope = _normalize_response(raw, validate_only)
     envelope.setdefault("warnings", []).insert(0, audit_line)
     return envelope
+
+
+# ----------------------------------------------------------------------------
+# update_campaign_bid (campaigns:mutate, dynamic updateMask)
+# ----------------------------------------------------------------------------
+
+_AUTO_STRATEGIES = {"MAXIMIZE_CONVERSIONS", "TARGET_CPA"}
+_ALLOWED_STRATEGIES = {"MANUAL_CPC"} | _AUTO_STRATEGIES
+_MIN_CONVERSIONS_FOR_AUTO = 30
+
+
+def _count_conversions_last_30d(
+    client: GoogleAdsClient,
+    formatted_customer_id: str,
+    campaign_id: str,
+) -> tuple[int, str]:
+    """Return (conversions, detail) for the campaign over the last 30 days."""
+    query = (
+        "SELECT metrics.conversions "
+        "FROM campaign "
+        f"WHERE campaign.id = {campaign_id} "
+        "AND segments.date DURING LAST_30_DAYS"
+    )
+    try:
+        resp = client.search(formatted_customer_id, query)
+    except Exception as exc:  # noqa: BLE001
+        return 0, f"conversions GAQL failed: {exc}"
+    total = 0.0
+    for row in resp.get("results", []) or []:
+        total += float(row.get("metrics", {}).get("conversions", 0) or 0)
+    return int(total), f"{total:.2f} conversions in last 30 days"
+
+
+@mcp.tool()
+async def update_campaign_bid(
+    customer_id: Annotated[
+        str,
+        Field(description="Google Ads customer ID (10 digits, no dashes)."),
+    ],
+    campaign_id: Annotated[
+        str,
+        Field(description="Campaign ID to update."),
+    ],
+    bid_strategy: Annotated[
+        str,
+        Field(description="MANUAL_CPC | MAXIMIZE_CONVERSIONS | TARGET_CPA. Phase 1 only."),
+    ],
+    cpc_bid_ceiling_micros: Annotated[
+        int,
+        Field(description="Required for MANUAL_CPC. In micros. Example: 400_000 = 0.40 currency units."),
+    ] = 0,
+    target_cpa_micros: Annotated[
+        int,
+        Field(description="Required for TARGET_CPA. In micros."),
+    ] = 0,
+    validate_only: Annotated[
+        bool,
+        Field(description="If True (default), Google validates but does not apply."),
+    ] = True,
+) -> dict:
+    """Switch a campaign''s bidding strategy (and any required bid value).
+
+    Uses ``campaigns:mutate`` with a dynamic ``updateMask`` covering
+    only the fields actually being changed. Phase 1 supports three
+    strategies: ``MANUAL_CPC``, ``MAXIMIZE_CONVERSIONS``, ``TARGET_CPA``.
+    Other strategies (``MAXIMIZE_CLICKS``, ``TARGET_ROAS``, portfolio
+    strategies) are intentionally left out and must be edited in the
+    UI until we have a real reason to automate them.
+
+    Safety guardrail: switching INTO an automated strategy
+    (``MAXIMIZE_CONVERSIONS`` or ``TARGET_CPA``) requires at least
+    ``_MIN_CONVERSIONS_FOR_AUTO`` (30) conversions in the last 30
+    days, verified via GAQL. Google''s smart bidding needs that
+    signal volume; starting smart bidding on a dry campaign burns
+    budget without learning anything.
+
+    Args:
+        customer_id, campaign_id: resource coordinates.
+        bid_strategy: one of MANUAL_CPC / MAXIMIZE_CONVERSIONS /
+            TARGET_CPA.
+        cpc_bid_ceiling_micros: required for MANUAL_CPC. Ignored
+            for other strategies.
+        target_cpa_micros: required for TARGET_CPA. Ignored for
+            other strategies.
+        validate_only: default True.
+
+    Returns:
+        CREAVY mutate envelope.
+    """
+    strategy = (bid_strategy or "").upper()
+    if strategy not in _ALLOWED_STRATEGIES:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": [
+                f"bid_strategy must be one of {sorted(_ALLOWED_STRATEGIES)}, got {bid_strategy!r}"
+            ],
+            "raw": {},
+        }
+
+    if strategy == "MANUAL_CPC" and cpc_bid_ceiling_micros <= 0:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": ["MANUAL_CPC requires cpc_bid_ceiling_micros > 0"],
+            "raw": {},
+        }
+    if strategy == "TARGET_CPA" and target_cpa_micros <= 0:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": ["TARGET_CPA requires target_cpa_micros > 0"],
+            "raw": {},
+        }
+
+    formatted_customer_id = format_customer_id(customer_id)
+    campaign_resource = (
+        f"customers/{formatted_customer_id}/campaigns/{campaign_id}"
+    )
+    client = GoogleAdsClient()
+
+    # Guardrail for auto strategies: require recent conversion volume.
+    warnings: list[str] = []
+    if strategy in _AUTO_STRATEGIES:
+        count, detail = _count_conversions_last_30d(
+            client, formatted_customer_id, campaign_id,
+        )
+        if count < _MIN_CONVERSIONS_FOR_AUTO:
+            return {
+                "success": False,
+                "validate_only": validate_only,
+                "resource_names": [],
+                "partial_failures": [],
+                "warnings": [
+                    f"refused: switching to {strategy} requires >= "
+                    f"{_MIN_CONVERSIONS_FOR_AUTO} conversions in the last 30 days ({detail})"
+                ],
+                "raw": {},
+            }
+        warnings.append(f"conversions check ok: {detail}")
+
+    update_body: dict[str, Any] = {
+        "resourceName": campaign_resource,
+    }
+    update_mask_fields: list[str] = []
+
+    if strategy == "MANUAL_CPC":
+        update_body["manualCpc"] = {}
+        update_body["campaignBiddingStrategyOneof"] = "manualCpc"
+        update_body["manualCpc"] = {"enhancedCpcEnabled": False}
+        update_mask_fields.append("manual_cpc.enhanced_cpc_enabled")
+        update_body["biddingStrategyType"] = "MANUAL_CPC"
+        # Ceiling is stored on the campaign itself.
+        update_body["bidCeilingMicros"] = str(cpc_bid_ceiling_micros)
+        update_mask_fields.append("bid_ceiling_micros")
+    elif strategy == "MAXIMIZE_CONVERSIONS":
+        update_body["maximizeConversions"] = {}
+        update_mask_fields.append("maximize_conversions")
+    elif strategy == "TARGET_CPA":
+        update_body["targetCpa"] = {"targetCpaMicros": str(target_cpa_micros)}
+        update_mask_fields.append("target_cpa.target_cpa_micros")
+
+    operation = {
+        "update": update_body,
+        "updateMask": ",".join(update_mask_fields),
+    }
+    raw = client.mutate(
+        customer_id=formatted_customer_id,
+        resource="campaigns",
+        operations=[operation],
+        validate_only=validate_only,
+    )
+    envelope = _normalize_response(raw, validate_only)
+    envelope["warnings"] = warnings + envelope.get("warnings", [])
+    return envelope
