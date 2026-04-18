@@ -58,6 +58,7 @@ def _register_tools() -> None:
     from creavy_ads.tools import (  # noqa: F401
         assets,
         creatives,
+        mutate,
         read_queries,
         resources_and_prompts,
     )
