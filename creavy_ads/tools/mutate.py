@@ -183,3 +183,158 @@ async def pause_campaign(
         validate_only=validate_only,
     )
     return _normalize_response(raw, validate_only)
+
+
+# ----------------------------------------------------------------------------
+# enable_campaign + spend-cap safety helper
+# ----------------------------------------------------------------------------
+
+def _verify_spend_cap(client: GoogleAdsClient, formatted_customer_id: str) -> tuple[bool, str]:
+    """Return (has_cap, detail) for the given account.
+
+    Policy: we only allow ENABLE flows if Google reports an account-level
+    spend cap via ``account_budget``. The API does not expose a single
+    boolean, so we look for any active ``account_budget`` row.
+
+    The check is best-effort: if the GAQL fails (e.g. missing scope,
+    not a billing-managed MCC), we return ``(False, <error>)`` so the
+    caller refuses the apply and surfaces the reason. This is the safe
+    default — writes stay off until humans verify the cap in the UI.
+    """
+    query = (
+        "SELECT account_budget.status, account_budget.approved_spending_limit_micros "
+        "FROM account_budget "
+        "WHERE account_budget.status = 'APPROVED'"
+    )
+    try:
+        resp = client.search(formatted_customer_id, query)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"spend-cap check failed: {exc}"
+    rows = resp.get("results", []) or []
+    if not rows:
+        return False, "no APPROVED account_budget found — set a spend cap in Google Ads UI"
+    return True, f"{len(rows)} active account_budget row(s)"
+
+
+@mcp.tool()
+async def enable_campaign(
+    customer_id: Annotated[
+        str,
+        Field(description="Google Ads customer ID (10 digits, no dashes)."),
+    ],
+    campaign_id: Annotated[
+        str,
+        Field(description="Campaign ID to enable (numeric string)."),
+    ],
+    validate_only: Annotated[
+        bool,
+        Field(
+            description=(
+                "If True (default), Google validates the change but does NOT apply it. "
+                "Set to False only after the user has explicitly confirmed the apply."
+            ),
+        ),
+    ] = True,
+) -> dict:
+    """Enable a Google Ads campaign (transitions status to ``ENABLED``).
+
+    STARTS SPENDING MONEY. Safety gates:
+
+    1. Read-before-write: fetch current status. If already ENABLED,
+       short-circuit to a no-op envelope.
+    2. Spend-cap check: call ``_verify_spend_cap``. If no approved
+       account_budget is found, REFUSE even with ``validate_only=False``.
+       This matches the policy in ``mutate-api-design.md`` — a spend
+       cap must exist in the UI before any write access is opened.
+
+    Args:
+        customer_id: Google Ads customer ID.
+        campaign_id: Numeric campaign ID to enable.
+        validate_only: If True (default), Google validates but does not
+            apply.
+
+    Returns:
+        The CREAVY mutate envelope.
+    """
+    formatted_customer_id = format_customer_id(customer_id)
+    campaign_resource = (
+        f"customers/{formatted_customer_id}/campaigns/{campaign_id}"
+    )
+
+    client = GoogleAdsClient()
+
+    # Safety gate 1: spend cap must exist (applies even in validate_only mode;
+    # if no cap is configured, there is nothing to validate against and we
+    # do not want operators thinking "validate passed => safe to apply").
+    has_cap, cap_detail = _verify_spend_cap(client, formatted_customer_id)
+    if not has_cap:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": [f"refused: {cap_detail}"],
+            "raw": {},
+        }
+
+    # Safety gate 2: confirm campaign exists and get current status.
+    pre_query = (
+        "SELECT campaign.id, campaign.name, campaign.status "
+        "FROM campaign "
+        f"WHERE campaign.id = {campaign_id}"
+    )
+    try:
+        pre = client.search(formatted_customer_id, pre_query)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("enable_campaign pre-check failed: %s", exc)
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": [f"pre-check failed: {exc}"],
+            "raw": {},
+        }
+
+    rows = pre.get("results", []) or []
+    if not rows:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": [
+                f"campaign {campaign_id} not found in account {formatted_customer_id}"
+            ],
+            "raw": pre,
+        }
+
+    current_status = rows[0].get("campaign", {}).get("status", "UNKNOWN")
+    if current_status == "ENABLED":
+        return {
+            "success": True,
+            "validate_only": validate_only,
+            "resource_names": [campaign_resource],
+            "partial_failures": [],
+            "warnings": [
+                f"campaign {campaign_id} is already ENABLED — no-op, mutate not called"
+            ],
+            "raw": pre,
+        }
+
+    operation = {
+        "update": {
+            "resourceName": campaign_resource,
+            "status": "ENABLED",
+        },
+        "updateMask": "status",
+    }
+    raw = client.mutate(
+        customer_id=formatted_customer_id,
+        resource="campaigns",
+        operations=[operation],
+        validate_only=validate_only,
+    )
+    envelope = _normalize_response(raw, validate_only)
+    envelope.setdefault("warnings", []).append(f"spend-cap ok: {cap_detail}")
+    return envelope
