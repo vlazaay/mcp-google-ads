@@ -11,7 +11,6 @@ FROM python:3.11-slim AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    UV_SYSTEM_PYTHON=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
@@ -28,9 +27,8 @@ COPY creavy_ads ./creavy_ads
 COPY google_ads_server.py ./google_ads_server.py
 
 # Create venv and install the project (and its deps) into it.
-RUN uv venv /opt/venv \
- && . /opt/venv/bin/activate \
- && uv pip install --no-cache .
+RUN uv venv /opt/venv --python /usr/local/bin/python3 \
+ && VIRTUAL_ENV=/opt/venv uv pip install --no-cache --python /opt/venv/bin/python .
 
 # ---------- runtime ----------
 FROM python:3.11-slim AS runtime
