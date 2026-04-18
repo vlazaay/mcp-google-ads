@@ -1,0 +1,50 @@
+# VCS
+.git
+.gitignore
+
+# Python caches
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv
+.env
+*.env
+\!.env.example
+
+# Build artefacts
+build
+dist
+*.egg-info
+
+# Tests / tooling
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# IDE
+.vscode
+.idea
+
+# Docs / assets not needed at runtime
+docs/
+*.md
+\!README.md
+bg.jpeg
+ixigo-logo.png
+google-ads.svg
+pulls/
+
+# Local secrets / tokens (never bake into image)
+google_ads_token.json
+service_account_credentials.json
+credentials.json
+token.json
+data/
+
+# Deploy dir (runbook only, not needed in image)
+deploy/

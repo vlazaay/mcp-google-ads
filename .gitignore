@@ -53,4 +53,6 @@ site/
 
 google_ads_token.json
 
-uv.lock
+# Local deployment notes
+deploy/RUNBOOK.md
+
