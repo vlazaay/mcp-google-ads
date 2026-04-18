@@ -1,16 +1,7 @@
-def format_customer_id(customer_id: str) -> str:
-    """Format customer ID to ensure it's 10 digits without dashes."""
-    # Convert to string if passed as integer or another type
-    customer_id = str(customer_id)
-    
-    # Remove any quotes surrounding the customer_id (both escaped and unescaped)
-    customer_id = customer_id.replace('\"', '').replace('"', '')
-    
-    # Remove any non-digit characters (including dashes, braces, etc.)
-    customer_id = ''.join(char for char in customer_id if char.isdigit())
-    
-    # Ensure it's 10 digits with leading zeros if needed
-    return customer_id.zfill(10)
+"""Test format_customer_id from the creavy_ads package."""
+
+from creavy_ads.auth import format_customer_id
+
 
 def test_format_customer_id():
     """Test the format_customer_id function with various input formats."""
@@ -30,7 +21,7 @@ def test_format_customer_id():
         # ID with other non-digit characters
         ("{9873186703}", "9873186703"),
     ]
-    
+
     print("\n=== Testing format_customer_id with various formats ===")
     for input_id, expected in test_cases:
         result = format_customer_id(input_id)
@@ -40,6 +31,7 @@ def test_format_customer_id():
         print(f"Test {'PASSED' if result == expected else 'FAILED'}")
         print("-" * 50)
 
+
 if __name__ == "__main__":
     # Run format_customer_id tests
-    test_format_customer_id() 
+    test_format_customer_id()

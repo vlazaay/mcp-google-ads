@@ -29,9 +29,13 @@ dependencies = [
 "Homepage" = "https://github.com/cohnen/mcp-google-ads"
 "Bug Tracker" = "https://github.com/cohnen/mcp-google-ads/issues"
 
+[project.scripts]
+creavy-ads-mcp = "creavy_ads.server:main"
+
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["mcp_google_ads"]
+packages = ["creavy_ads", "creavy_ads.tools"]
+py-modules = ["google_ads_server"]
