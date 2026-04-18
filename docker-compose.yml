@@ -29,7 +29,7 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - "curl -fsS -m 2 -H 'Accept: text/event-stream' http://127.0.0.1:8765/sse >/dev/null || exit 1"
+        - "curl -fsS -m 2 -o /dev/null http://127.0.0.1:8765/sse -H 'Accept: text/event-stream' || test $? -eq 28"
       interval: 30s
       timeout: 5s
       retries: 3

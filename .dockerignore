@@ -12,7 +12,7 @@ __pycache__
 venv
 .env
 *.env
-\!.env.example
+!.env.example
 
 # Build artefacts
 build
@@ -33,7 +33,7 @@ htmlcov
 # Docs / assets not needed at runtime
 docs/
 *.md
-\!README.md
+!README.md
 bg.jpeg
 ixigo-logo.png
 google-ads.svg
