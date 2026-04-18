@@ -949,3 +949,207 @@ async def create_ad_group(
         validate_only=validate_only,
     )
     return _normalize_response(raw, validate_only)
+
+
+# ----------------------------------------------------------------------------
+# create_responsive_search_ad (adGroupAds:mutate)
+# ----------------------------------------------------------------------------
+
+_HEADLINE_MIN = 3
+_HEADLINE_MAX = 15
+_HEADLINE_CHAR_LIMIT = 30
+_DESCRIPTION_MIN = 2
+_DESCRIPTION_MAX = 4
+_DESCRIPTION_CHAR_LIMIT = 90
+_PATH_CHAR_LIMIT = 15
+_VALID_PINNED_FIELDS = {
+    "HEADLINE_1", "HEADLINE_2", "HEADLINE_3",
+    "DESCRIPTION_1", "DESCRIPTION_2",
+}
+
+
+def _is_latin_path(s: str) -> bool:
+    """Path1/path2 must be ASCII letters/digits/hyphen only."""
+    if not s:
+        return True
+    return all(c.isascii() and (c.isalnum() or c in {"-", "_"}) for c in s)
+
+
+def _validate_rsa_inputs(
+    headlines: list,
+    descriptions: list,
+    final_urls: list,
+    path1: str | None,
+    path2: str | None,
+) -> list[str]:
+    """Return a list of human-readable validation errors (empty = ok)."""
+    errors: list[str] = []
+
+    if not final_urls or not any((u or "").strip() for u in final_urls):
+        errors.append("final_urls must contain at least one non-empty URL")
+
+    if not isinstance(headlines, list):
+        errors.append("headlines must be a list")
+        return errors
+    if len(headlines) < _HEADLINE_MIN or len(headlines) > _HEADLINE_MAX:
+        errors.append(
+            f"headlines: expected {_HEADLINE_MIN}..{_HEADLINE_MAX} items, got {len(headlines)}"
+        )
+    for i, h in enumerate(headlines):
+        if isinstance(h, str):
+            text = h
+            pinned = None
+        elif isinstance(h, dict):
+            text = h.get("text", "")
+            pinned = (h.get("pinned_field") or h.get("pinnedField") or "") or None
+            if pinned is not None and pinned.upper() not in _VALID_PINNED_FIELDS:
+                errors.append(
+                    f"headlines[{i}]: pinned_field {pinned!r} not in {sorted(_VALID_PINNED_FIELDS)}"
+                )
+        else:
+            errors.append(f"headlines[{i}]: must be str or dict, got {type(h).__name__}")
+            continue
+        if not text or not text.strip():
+            errors.append(f"headlines[{i}]: text is required")
+        elif len(text) > _HEADLINE_CHAR_LIMIT:
+            errors.append(
+                f"headlines[{i}]: text is {len(text)} chars, limit is {_HEADLINE_CHAR_LIMIT}"
+            )
+
+    if not isinstance(descriptions, list):
+        errors.append("descriptions must be a list")
+        return errors
+    if len(descriptions) < _DESCRIPTION_MIN or len(descriptions) > _DESCRIPTION_MAX:
+        errors.append(
+            f"descriptions: expected {_DESCRIPTION_MIN}..{_DESCRIPTION_MAX} items, got {len(descriptions)}"
+        )
+    for i, d in enumerate(descriptions):
+        if not isinstance(d, str) or not d.strip():
+            errors.append(f"descriptions[{i}]: text is required (string)")
+        elif len(d) > _DESCRIPTION_CHAR_LIMIT:
+            errors.append(
+                f"descriptions[{i}]: text is {len(d)} chars, limit is {_DESCRIPTION_CHAR_LIMIT}"
+            )
+
+    for label, value in (("path1", path1), ("path2", path2)):
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str):
+            errors.append(f"{label}: must be string or None")
+            continue
+        if len(value) > _PATH_CHAR_LIMIT:
+            errors.append(
+                f"{label}: {len(value)} chars, limit is {_PATH_CHAR_LIMIT}"
+            )
+        if not _is_latin_path(value):
+            errors.append(f"{label}: must contain only ASCII letters/digits/hyphen/underscore")
+
+    return errors
+
+
+@mcp.tool()
+async def create_responsive_search_ad(
+    customer_id: Annotated[
+        str,
+        Field(description="Google Ads customer ID (10 digits, no dashes)."),
+    ],
+    ad_group_id: Annotated[
+        str,
+        Field(description="Parent ad group ID."),
+    ],
+    headlines: Annotated[
+        list,
+        Field(description="3-15 items. Each item is either a string (unpinned) or a dict {text, pinned_field}. Each text <=30 chars."),
+    ],
+    descriptions: Annotated[
+        list,
+        Field(description="2-4 items. Each is a string <=90 chars."),
+    ],
+    final_urls: Annotated[
+        list,
+        Field(description="One or more final URLs (strings)."),
+    ],
+    path1: Annotated[
+        str,
+        Field(description="Optional display URL path1 — ASCII only, <=15 chars."),
+    ] = "",
+    path2: Annotated[
+        str,
+        Field(description="Optional display URL path2 — ASCII only, <=15 chars."),
+    ] = "",
+    validate_only: Annotated[
+        bool,
+        Field(description="If True (default), Google validates but does not apply."),
+    ] = True,
+) -> dict:
+    """Create a Responsive Search Ad inside an ad group (adGroupAds:mutate).
+
+    Client-side validation runs before any API call so silly mistakes
+    (too few headlines, text over Google''s character limits, Cyrillic
+    characters in path slugs) fail fast with a readable error list
+    instead of a generic Google INVALID_ARGUMENT error.
+
+    Limits enforced:
+    - Headlines: 3-15 items, each <=30 chars.
+    - Descriptions: 2-4 items, each <=90 chars.
+    - Path1/path2: <=15 chars, ASCII letters/digits/hyphen/underscore.
+    - Pinned headline positions limited to HEADLINE_{1,2,3} and
+      DESCRIPTION_{1,2} (Google schema).
+
+    The created ad is always PAUSED so operators can preview before
+    enabling. Status flip is a separate workflow (UI or future
+    ``update_ad_group_ad`` tool).
+    """
+    errors = _validate_rsa_inputs(headlines, descriptions, final_urls, path1 or None, path2 or None)
+    if errors:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": errors,
+            "raw": {},
+        }
+
+    formatted_customer_id = format_customer_id(customer_id)
+    ad_group_resource = (
+        f"customers/{formatted_customer_id}/adGroups/{ad_group_id}"
+    )
+
+    def _headline_payload(h):
+        if isinstance(h, str):
+            return {"text": h}
+        out = {"text": h.get("text", "")}
+        pinned = (h.get("pinned_field") or h.get("pinnedField") or "")
+        if pinned:
+            out["pinnedField"] = pinned.upper()
+        return out
+
+    ad_payload: dict[str, Any] = {
+        "finalUrls": [u for u in final_urls if (u or "").strip()],
+        "responsiveSearchAd": {
+            "headlines": [_headline_payload(h) for h in headlines],
+            "descriptions": [{"text": d} for d in descriptions],
+        },
+    }
+    if path1:
+        ad_payload["responsiveSearchAd"]["path1"] = path1
+    if path2:
+        ad_payload["responsiveSearchAd"]["path2"] = path2
+
+    operation = {
+        "create": {
+            "adGroup": ad_group_resource,
+            "status": "PAUSED",
+            "ad": ad_payload,
+        }
+    }
+
+    client = GoogleAdsClient()
+    raw = client.mutate(
+        customer_id=formatted_customer_id,
+        resource="adGroupAds",
+        operations=[operation],
+        validate_only=validate_only,
+    )
+    return _normalize_response(raw, validate_only)
