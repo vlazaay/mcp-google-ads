@@ -514,3 +514,148 @@ async def add_negative_keywords(
     envelope = _normalize_response(raw, validate_only)
     envelope["warnings"] = warnings + envelope.get("warnings", [])
     return envelope
+
+
+# ----------------------------------------------------------------------------
+# update_campaign_budget (campaignBudgets:mutate)
+# ----------------------------------------------------------------------------
+
+_BUDGET_CHANGE_REFUSE_THRESHOLD = 0.5  # 50% delta in either direction
+
+
+@mcp.tool()
+async def update_campaign_budget(
+    customer_id: Annotated[
+        str,
+        Field(description="Google Ads customer ID (10 digits, no dashes)."),
+    ],
+    campaign_budget_id: Annotated[
+        str,
+        Field(description="campaignBudget ID (not campaign ID)."),
+    ],
+    amount_micros: Annotated[
+        int,
+        Field(description="New daily budget in account currency micros. 1 currency unit = 1_000_000 micros (e.g. 50_000_000 = 50 UAH/day)."),
+    ],
+    force: Annotated[
+        bool,
+        Field(description="Bypass the +/-50% safety check. Only set True after operator reconfirmation."),
+    ] = False,
+    validate_only: Annotated[
+        bool,
+        Field(description="If True (default), Google validates but does not apply."),
+    ] = True,
+) -> dict:
+    """Change a campaignBudget''s daily ``amountMicros``.
+
+    Uses ``campaignBudgets:mutate`` with ``updateMask=amount_micros``.
+
+    Safety guardrail: before issuing the mutate we GAQL-fetch the
+    current ``campaign_budget.amount_micros``. If the new value is
+    more than +/-50% away from the current value, the tool refuses
+    with a clear warning UNLESS ``force=True`` is passed. Both the
+    before and after values always land in ``warnings`` so change
+    logs are auditable.
+
+    Args:
+        customer_id: Google Ads customer ID.
+        campaign_budget_id: campaignBudget ID (surface it via a GAQL
+            ``SELECT campaign_budget.id FROM campaign`` pivot first if
+            you only know the campaign ID).
+        amount_micros: New daily budget in micros.
+        force: Bypass the +/-50% guard.
+        validate_only: Default True.
+
+    Returns:
+        CREAVY mutate envelope.
+    """
+    if amount_micros is None or amount_micros <= 0:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": ["amount_micros must be a positive integer"],
+            "raw": {},
+        }
+
+    formatted_customer_id = format_customer_id(customer_id)
+    budget_resource = (
+        f"customers/{formatted_customer_id}/campaignBudgets/{campaign_budget_id}"
+    )
+    client = GoogleAdsClient()
+
+    pre_query = (
+        "SELECT campaign_budget.id, campaign_budget.amount_micros, campaign_budget.name "
+        "FROM campaign_budget "
+        f"WHERE campaign_budget.id = {campaign_budget_id}"
+    )
+    try:
+        pre = client.search(formatted_customer_id, pre_query)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("update_campaign_budget pre-check failed: %s", exc)
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": [f"pre-check failed: {exc}"],
+            "raw": {},
+        }
+
+    rows = pre.get("results", []) or []
+    if not rows:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": [
+                f"campaign_budget {campaign_budget_id} not found in account {formatted_customer_id}"
+            ],
+            "raw": pre,
+        }
+
+    current_raw = rows[0].get("campaignBudget", {}).get("amountMicros", 0)
+    try:
+        current = int(current_raw)
+    except (TypeError, ValueError):
+        current = 0
+
+    audit_line = (
+        f"budget change: before={current} micros, after={amount_micros} micros"
+    )
+
+    if current > 0:
+        ratio = amount_micros / current
+        delta = ratio - 1.0
+        if (abs(delta) > _BUDGET_CHANGE_REFUSE_THRESHOLD) and not force:
+            return {
+                "success": False,
+                "validate_only": validate_only,
+                "resource_names": [],
+                "partial_failures": [],
+                "warnings": [
+                    f"refused: delta={delta*100:.1f}% exceeds +/-{int(_BUDGET_CHANGE_REFUSE_THRESHOLD*100)}%; "
+                    "re-issue with force=True to override",
+                    audit_line,
+                ],
+                "raw": pre,
+            }
+
+    operation = {
+        "update": {
+            "resourceName": budget_resource,
+            "amountMicros": str(amount_micros),
+        },
+        "updateMask": "amount_micros",
+    }
+    raw = client.mutate(
+        customer_id=formatted_customer_id,
+        resource="campaignBudgets",
+        operations=[operation],
+        validate_only=validate_only,
+    )
+    envelope = _normalize_response(raw, validate_only)
+    envelope.setdefault("warnings", []).insert(0, audit_line)
+    return envelope
