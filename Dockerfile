@@ -74,4 +74,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS -m 2 -H "Accept: text/event-stream" \
         "http://127.0.0.1:${MCP_PORT}/sse" >/dev/null || exit 1
 
-ENTRYPOINT ["python", "-m", "creavy_ads.server"]
+ENTRYPOINT ["python", "-m", "creavy_ads"]
