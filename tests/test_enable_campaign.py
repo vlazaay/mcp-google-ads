@@ -3,7 +3,7 @@
 Focus:
     - Spend-cap gate always runs first; refuses when cap is missing.
     - Already-ENABLED short-circuits.
-    - Mutate URL/payload matches Google REST v19 spec.
+    - Mutate URL/payload matches Google REST v23 spec.
     - Missing campaign surfaces a failure envelope.
 """
 

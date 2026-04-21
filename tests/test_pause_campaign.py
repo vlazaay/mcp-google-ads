@@ -3,7 +3,7 @@
 Goals:
     1. Confirm the GAQL pre-check is issued before any mutate call.
     2. Confirm the mutate URL and payload shape match Google Ads REST
-       v19 spec for a campaigns:mutate update.
+       v23 spec for a campaigns:mutate update.
     3. Confirm validate_only=True is the default and is plumbed
        through to the HTTP layer.
     4. Confirm the "already PAUSED" no-op short-circuits the mutate.
