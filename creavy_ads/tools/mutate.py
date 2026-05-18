@@ -1337,6 +1337,7 @@ async def create_campaign(
         "advertisingChannelType": merged["channel_type"].upper(),
         "campaignBudget": budget_ref_for_step2,
         "networkSettings": merged["network_settings"],
+        "containsEuPoliticalAdvertising": "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
     }
     strategy = merged["bid_strategy"].upper()
     if strategy == "MANUAL_CPC":
