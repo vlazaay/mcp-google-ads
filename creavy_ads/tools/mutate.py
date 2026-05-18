@@ -517,6 +517,160 @@ async def add_negative_keywords(
 
 
 # ----------------------------------------------------------------------------
+# add_keywords (adGroupCriteria:mutate)
+# ----------------------------------------------------------------------------
+
+_POSITIVE_MATCH_TYPES = {"EXACT", "PHRASE"}
+
+
+@mcp.tool()
+async def add_keywords(
+    customer_id: Annotated[
+        str,
+        Field(description="Google Ads customer ID (10 digits, no dashes)."),
+    ],
+    ad_group_id: Annotated[
+        str,
+        Field(description="Ad group ID that will receive the keywords."),
+    ],
+    keywords: Annotated[
+        list[str],
+        Field(description="Positive keyword texts. Duplicates (case-insensitive) and existing keywords in the ad group are filtered out before the API call."),
+    ],
+    match_type: Annotated[
+        str,
+        Field(description="Match type — PHRASE or EXACT. BROAD is intentionally not supported here; create negatives separately if you need broad."),
+    ] = "PHRASE",
+    validate_only: Annotated[
+        bool,
+        Field(description="If True (default), Google validates but does not apply."),
+    ] = True,
+) -> dict:
+    """Attach positive keywords to an ad group via adGroupCriteria:mutate.
+
+    Mirrors :func:`add_negative_keywords` but targets ad-group-level
+    positive criteria (status=ENABLED, no ``negative`` flag).
+
+    Workflow:
+
+    1. Validate ``match_type`` is PHRASE or EXACT.
+    2. Fetch existing keywords on the ad group via GAQL and strip
+       duplicates (case-insensitive, same match type).
+    3. Cap the remaining list at Google's 50-per-call limit.
+    4. Issue the mutate with ``partialFailure=True``.
+    """
+    match_type_upper = (match_type or "").upper()
+    if match_type_upper not in _POSITIVE_MATCH_TYPES:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": [
+                f"invalid match_type {match_type!r} — must be one of {sorted(_POSITIVE_MATCH_TYPES)}"
+            ],
+            "raw": {},
+        }
+
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for kw in keywords or []:
+        trimmed = (kw or "").strip()
+        if not trimmed:
+            continue
+        key = trimmed.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(trimmed)
+
+    if not cleaned:
+        return {
+            "success": False,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": ["no non-empty keywords supplied after trimming/dedup"],
+            "raw": {},
+        }
+
+    formatted_customer_id = format_customer_id(customer_id)
+    ad_group_resource = (
+        f"customers/{formatted_customer_id}/adGroups/{ad_group_id}"
+    )
+    client = GoogleAdsClient()
+
+    existing_query = (
+        "SELECT ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type "
+        "FROM ad_group_criterion "
+        f"WHERE ad_group_criterion.negative = FALSE "
+        f"AND ad_group_criterion.type = KEYWORD "
+        f"AND ad_group.id = {ad_group_id}"
+    )
+    existing: set[tuple[str, str]] = set()
+    try:
+        resp = client.search(formatted_customer_id, existing_query)
+        for row in resp.get("results", []) or []:
+            kw_info = row.get("adGroupCriterion", {}).get("keyword", {})
+            text = (kw_info.get("text") or "").lower()
+            mtype = (kw_info.get("matchType") or "").upper()
+            if text:
+                existing.add((text, mtype))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("existing-keywords pre-check failed: %s", exc)
+
+    warnings: list[str] = []
+    kept: list[str] = []
+    for kw in cleaned:
+        if (kw.lower(), match_type_upper) in existing:
+            warnings.append(f"skip duplicate keyword: {kw!r}")
+            continue
+        kept.append(kw)
+
+    if len(kept) > _GOOGLE_MAX_KEYWORDS_PER_CALL:
+        dropped = kept[_GOOGLE_MAX_KEYWORDS_PER_CALL:]
+        kept = kept[:_GOOGLE_MAX_KEYWORDS_PER_CALL]
+        warnings.append(
+            f"exceeded Google per-call limit of {_GOOGLE_MAX_KEYWORDS_PER_CALL}; "
+            f"dropped {len(dropped)} keyword(s): re-issue in another batch"
+        )
+
+    if not kept:
+        return {
+            "success": True,
+            "validate_only": validate_only,
+            "resource_names": [],
+            "partial_failures": [],
+            "warnings": warnings or ["all supplied keywords are already present — no-op"],
+            "raw": {},
+        }
+
+    operations = [
+        {
+            "create": {
+                "adGroup": ad_group_resource,
+                "status": "ENABLED",
+                "keyword": {
+                    "text": kw,
+                    "matchType": match_type_upper,
+                },
+            }
+        }
+        for kw in kept
+    ]
+
+    raw = client.mutate(
+        customer_id=formatted_customer_id,
+        resource="adGroupCriteria",
+        operations=operations,
+        validate_only=validate_only,
+    )
+    envelope = _normalize_response(raw, validate_only)
+    envelope["warnings"] = warnings + envelope.get("warnings", [])
+    return envelope
+
+
+# ----------------------------------------------------------------------------
 # update_campaign_budget (campaignBudgets:mutate)
 # ----------------------------------------------------------------------------
 
